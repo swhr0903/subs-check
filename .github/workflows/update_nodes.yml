@@ -1,51 +1,58 @@
-name: Update Proxy Nodes
+name: Manual Proxy Update
 
 on:
   schedule:
-    - cron: '0 */6 * * *' 
-  workflow_dispatch: 
+    - cron: '0 */6 * * *' # 每6小时运行一次
+  workflow_dispatch:      # 允许手动触发运行
 
 jobs:
-  run-go-app:
+  build-and-run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.21' # 或者是项目要求的版本
+          go-version: '>=1.21'
+          cache: true
 
-      - name: Build and Run
+      - name: Run Go App
         run: |
           # 1. 确保输出目录存在
           mkdir -p output
           
-          # 2. 编译 Go 程序 (假设 main.go 在根目录)
-          # 如果 main.go 在 cmd 目录下，请修改路径，例如 go build ./cmd/main.go
-          go build -o crawler main.go
+          # 2. 整理依赖并编译整个目录（解决 undefined: Version 报错）
+          go mod tidy
+          go build -o proxy_tool .
           
           # 3. 运行编译后的程序
-          # 程序会自动读取 ./config 里的文件，并写入 ./output
-          chmod +x ./crawler
-          ./crawler
+          # 程序会自动读取 ./config 并在 ./output 下生成结果
+          chmod +x ./proxy_tool
+          ./proxy_tool
 
       - name: Upload Result to Cloudflare KV
         run: |
-          # 假设程序生成的文件叫 ./output/nodes.txt
-          RESULT_FILE="./output/nodes.txt"
+          # 自动寻找 output 目录下生成的第一个文件作为结果
+          echo "Listing output directory content:"
+          ls -R output/
           
-          if [ -f "$RESULT_FILE" ]; then
+          RESULT_FILE=$(find output -type f | head -n 1)
+          
+          if [ -n "$RESULT_FILE" ]; then
+            echo "Found result file: $RESULT_FILE"
             NODES=$(cat "$RESULT_FILE")
             
+            # 推送到 Cloudflare KV
+            # 确保你已在 GitHub Secrets 中设置了 CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID, CF_API_TOKEN
             curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
                  -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                  -H "Content-Type: text/plain" \
                  --data "$NODES"
-            echo "Successfully uploaded!"
+            
+            echo "Successfully uploaded to Cloudflare!"
           else
-            echo "Error: Output file not found! Please check the filename in ./output/"
-            ls -R ./output/ # 打印目录结构方便排查
+            echo "Error: No output file found in ./output/ directory!"
             exit 1
           fi
