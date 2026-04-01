@@ -1,0 +1,51 @@
+name: Update Proxy Nodes
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' 
+  workflow_dispatch: 
+
+jobs:
+  run-go-app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21' # 或者是项目要求的版本
+
+      - name: Build and Run
+        run: |
+          # 1. 确保输出目录存在
+          mkdir -p output
+          
+          # 2. 编译 Go 程序 (假设 main.go 在根目录)
+          # 如果 main.go 在 cmd 目录下，请修改路径，例如 go build ./cmd/main.go
+          go build -o crawler main.go
+          
+          # 3. 运行编译后的程序
+          # 程序会自动读取 ./config 里的文件，并写入 ./output
+          chmod +x ./crawler
+          ./crawler
+
+      - name: Upload Result to Cloudflare KV
+        run: |
+          # 假设程序生成的文件叫 ./output/nodes.txt
+          RESULT_FILE="./output/nodes.txt"
+          
+          if [ -f "$RESULT_FILE" ]; then
+            NODES=$(cat "$RESULT_FILE")
+            
+            curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
+                 -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+                 -H "Content-Type: text/plain" \
+                 --data "$NODES"
+            echo "Successfully uploaded!"
+          else
+            echo "Error: Output file not found! Please check the filename in ./output/"
+            ls -R ./output/ # 打印目录结构方便排查
+            exit 1
+          fi
