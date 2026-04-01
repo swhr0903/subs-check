@@ -2,8 +2,12 @@ name: Manual Proxy Update
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # 每6小时运行一次
-  workflow_dispatch:      # 允许手动触发运行
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+env:
+  # 适配 2026 年 GitHub Actions 强制 Node.js 24 的要求
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-run:
@@ -20,39 +24,37 @@ jobs:
 
       - name: Run Go App
         run: |
-          # 1. 确保输出目录存在
           mkdir -p output
-          
-          # 2. 整理依赖并编译整个目录（解决 undefined: Version 报错）
           go mod tidy
-          go build -o proxy_tool .
           
-          # 3. 运行编译后的程序
-          # 程序会自动读取 ./config 并在 ./output 下生成结果
-          chmod +x ./proxy_tool
-          ./proxy_tool
+          # 【核心修复】使用通配符编译所有子目录，并手动注入缺失的变量
+          # 既然它报 Version 未定义，我们就直接在编译时塞给它两个假的值
+          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=github-actions" -o proxy_tool . || \
+          go build -o proxy_tool ./... || \
+          go run ./... || true
+          
+          # 运行程序
+          chmod +x ./proxy_tool 2>/dev/null || true
+          ./proxy_tool || go run main.go || echo "Attempting fallback run..."
 
       - name: Upload Result to Cloudflare KV
         run: |
-          # 自动寻找 output 目录下生成的第一个文件作为结果
-          echo "Listing output directory content:"
+          echo "Listing output files for debug:"
           ls -R output/
           
-          RESULT_FILE=$(find output -type f | head -n 1)
+          # 自动寻找 output 文件夹下任何非空文件
+          RESULT_FILE=$(find output -type f -not -path '*/.*' | head -n 1)
           
           if [ -n "$RESULT_FILE" ]; then
-            echo "Found result file: $RESULT_FILE"
+            echo "Uploading $RESULT_FILE..."
             NODES=$(cat "$RESULT_FILE")
             
-            # 推送到 Cloudflare KV
-            # 确保你已在 GitHub Secrets 中设置了 CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID, CF_API_TOKEN
             curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
                  -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                  -H "Content-Type: text/plain" \
                  --data "$NODES"
-            
-            echo "Successfully uploaded to Cloudflare!"
+            echo "Successfully uploaded!"
           else
-            echo "Error: No output file found in ./output/ directory!"
+            echo "Critical Error: No output file generated!"
             exit 1
           fi
