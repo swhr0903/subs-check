@@ -18,73 +18,38 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Build and Fix Config
+      - name: Compile and Run
         run: |
           # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
           
-          # 2. 关键：强行准备好配置文件目录
-          # 确保程序启动时直接就能看到 config/config.yaml，不触发它的初始化逻辑
-          mkdir -p config
-          if [ -f "config.yaml" ]; then
-            cp config.yaml config/config.yaml
-          elif [ -f "config/config.yaml" ]; then
-            echo "Config already in place."
-          else
-            # 如果仓库里只有 example，就改名，确保程序不报错
-            cp config/config.example.yaml config/config.yaml || echo "No config found"
-          fi
+          # 2. 第一次运行初始化（你提到的必须执行两次）
+          ./subs-check-bin || echo "Init done"
           
-          mkdir -p output
+          # 3. 第二次运行正式筛选
+          # 我们给程序设置一个 40 分钟的硬性执行时间，时间一到强制停止
+          # 这样它生成完文件后，即使进入 Web 循环也会被 timeout 掐断
+          timeout 40m ./subs-check-bin || echo "程序运行时间到或已完成"
 
-      - name: Smart Run and Upload
+      - name: Upload to Cloudflare KV
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo ">>> 启动程序 (后台运行)..."
-          # 使用绝对路径运行，防止相对路径丢失
-          CUR_DIR=$(pwd)
-          $CUR_DIR/subs-check-bin > run.log 2>&1 &
-          APP_PID=$!
-          
-          echo ">>> 监控 output/base64.txt..."
-          LAST_SIZE=0
-          STABLE_COUNT=0
-          
-          # 循环监控
-          for i in {1..120}; do
-            if [ -f "output/base64.txt" ]; then
-              CURRENT_SIZE=$(stat -c%s "output/base64.txt")
-              echo "文件大小: ${CURRENT_SIZE} 字节"
-              
-              if [ "$CURRENT_SIZE" -gt 1000 ] && [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
-                STABLE_COUNT=$((STABLE_COUNT + 1))
-              else
-                STABLE_COUNT=0
-              fi
-              
-              if [ "$STABLE_COUNT" -ge 2 ]; then
-                echo "✅ 写入完成！"
-                break
-              fi
-              LAST_SIZE=$CURRENT_SIZE
-            fi
-            
-            sleep 20
-            # 打印日志最后 3 行，确认它没在死循环创建配置
-            tail -n 3 run.log || true
-          done
-
-          echo ">>> 停止程序并上传..."
-          kill $APP_PID || true
-          
-          # 执行上传
-          curl -v -m 60 --connect-timeout 20 \
-            -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: text/plain" \
-            --data-binary @output/base64.txt
+          # 检查文件是否存在
+          if [ -f "output/base64.txt" ]; then
+            echo "✅ 找到文件，准备上传..."
+            # 直接上传，不带变量，不带复杂逻辑
+            curl -v -m 60 --connect-timeout 20 \
+              -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: text/plain" \
+              --data-binary @output/base64.txt
+          else
+            echo "❌ 错误：output/base64.txt 未生成！"
+            ls -R
+            exit 1
+          fi
