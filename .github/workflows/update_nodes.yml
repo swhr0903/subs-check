@@ -1,12 +1,12 @@
 name: Manual Proxy Update
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -18,48 +18,58 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Install and Run
+      - name: Compile and Run App
         run: |
-          # 1. 确保安装脚本有执行权限并运行它
-          # 如果脚本名不是 install.sh，请修改下面这一行
-          chmod +x install.sh
-          ./install.sh || echo "Install script finished"
-
-          # 2. 这里的关键：subs-check 安装后通常在根目录或 bin 下
-          # 我们尝试在当前目录编译并运行，确保能读到仓库里的 config 文件夹
+          # 1. 整理依赖
           go mod tidy
-          go build -ldflags "-X main.Version=1.0.0" -o subs-check-bin .
           
-          # 3. 运行程序，程序会自动读取当前目录下的 config/config.yaml
-          # 并默认在 output/ 目录下生成文件
+          # 2. 编译程序 (注入 Version 变量防止报错)
+          # 注意：这里直接编译当前目录
+          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=$(date +%Y%m%d)" -o subs-check-app .
+          
+          # 3. 准备输出目录
           mkdir -p output
-          ./subs-check-bin || echo "Execution finished"
           
-          # 4. 调试：看看到底生成了什么文件
-          echo "--- Files in output directory ---"
+          # 4. 运行程序
+          # 确保仓库根目录下有 config/config.yaml 文件
+          chmod +x ./subs-check-app
+          ./subs-check-app || echo "程序运行结束"
+          
+          # 5. 调试：确认生成了什么
+          echo "--- 检查 output 目录 ---"
           ls -R output/
 
-      - name: Upload to Cloudflare KV
+      - name: Upload Result to Cloudflare KV
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 寻找 output 目录下大小超过 100 字节的第一个非隐藏文件
-          RESULT_FILE=$(find output -type f -size +100c | head -n 1)
+          # 寻找 output 目录下生成的节点文件
+          # 排除隐藏文件和文件夹
+          RESULT_FILE=$(find output -type f -not -path '*/.*' -size +100c | head -n 1)
 
           if [ -z "$RESULT_FILE" ]; then
-            echo "Error: No valid node file found in output/ directory."
+            echo "错误：output 目录下未找到任何有效的节点文件！"
+            echo "当前目录结构如下："
+            ls -R
             exit 1
           fi
 
-          echo "Found result file: $RESULT_FILE"
+          echo "找到目标文件: $RESULT_FILE"
           NODES=$(cat "$RESULT_FILE")
 
-          # 执行上传
-          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
-               -H "Authorization: Bearer $CF_API_TOKEN" \
-               -H "Content-Type: text/plain" \
-               --data "$NODES"
-          
-          echo "Successfully uploaded to Cloudflare KV!"
+          echo "正在上传到 Cloudflare..."
+          # 使用 -w 打印状态码，-s 静默
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data "$NODES")
+
+          if [ "$RESPONSE" == "200" ]; then
+            echo "上传成功！状态码: 200"
+          else
+            echo "上传失败！状态码: $RESPONSE"
+            exit 1
+          fi
