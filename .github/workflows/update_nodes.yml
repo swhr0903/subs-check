@@ -18,38 +18,46 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Run
+      - name: Compile
         run: |
-          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          
-          # 2. 第一次运行初始化（你提到的必须执行两次）
-          ./subs-check-bin || echo "Init done"
-          
-          # 3. 第二次运行正式筛选
-          # 我们给程序设置一个 40 分钟的硬性执行时间，时间一到强制停止
-          # 这样它生成完文件后，即使进入 Web 循环也会被 timeout 掐断
-          timeout 40m ./subs-check-bin || echo "程序运行时间到或已完成"
+          mkdir -p output
 
-      - name: Upload to Cloudflare KV
+      - name: Run and Upload (Event Driven)
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 检查文件是否存在
-          if [ -f "output/base64.txt" ]; then
-            echo "✅ 找到文件，准备上传..."
-            # 直接上传，不带变量，不带复杂逻辑
-            curl -v -m 60 --connect-timeout 20 \
-              -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: text/plain" \
-              --data-binary @output/base64.txt
-          else
-            echo "❌ 错误：output/base64.txt 未生成！"
-            ls -R
-            exit 1
-          fi
+          # 1. 后台启动程序，完全不管它的死活
+          echo ">>> 启动程序..."
+          ./subs-check-bin > run.log 2>&1 &
+          
+          # 2. 进入死循环监控文件
+          echo ">>> 正在监控文件生成状态 (最多等待 50 分钟)..."
+          for i in {1..150}; do
+            # 检查文件是否存在且大小是否稳定（大于 5KB 认为基本写完）
+            if [ -f "output/base64.txt" ] && [ $(stat -c%s "output/base64.txt") -gt 5000 ]; then
+              echo "✅ 检测到 base64.txt 已生成，开始同步 KV..."
+              
+              # 3. 发现文件后，立刻执行上传
+              curl -s -v -m 60 --connect-timeout 20 \
+                -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: text/plain" \
+                --data-binary @output/base64.txt
+              
+              echo "🎉 上传成功！正在强制退出任务..."
+              # 4. 关键：直接杀死当前 Shell 进程，让 GitHub 认为 Step 成功结束
+              exit 0
+            fi
+            
+            # 每 20 秒检查一次，并打印程序最后一行日志确认进度
+            sleep 20
+            tail -n 1 run.log || true
+          done
+
+          echo "❌ 超时未找到文件"
+          exit 1
