@@ -20,42 +20,41 @@ jobs:
 
       - name: Compile and Run
         run: |
+          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          # 第一次運行初始化
+          
+          # 2. 初始化与运行 (运行两次以确保生成文件)
           ./subs-check-bin || true
           mkdir -p output
-          # 第二次運行篩選
           ./subs-check-bin || true
-          echo "--- 檢查 output 目錄 ---"
-          ls -lh output/
+          
+          # 3. 验证文件是否存在
+          if [ -f "output/base64.txt" ]; then
+            echo "✅ 成功生成文件: output/base64.txt"
+            ls -lh output/base64.txt
+          else
+            echo "❌ 错误：output/base64.txt 未生成！"
+            ls -R
+            exit 1
+          fi
 
-      - name: Upload to Cloudflare (Debug Mode)
+      - name: Upload to Cloudflare KV
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 1. 定位文件
-          RESULT_FILE=$(find output -type f -size +1k | head -n 1)
-          if [ -z "$RESULT_FILE" ]; then
-            echo "❌ [錯誤] 未找到結果文件，請檢查上面步驟的輸出。"
-            exit 1
-          fi
-
-          echo "🚀 [開始上傳] 文件路徑: $RESULT_FILE"
-          echo "📏 文件大小: $(du -h "$RESULT_FILE" | cut -f1)"
-
-          # 2. 執行上傳 (去掉 -s，增加詳細日誌)
-          # --connect-timeout 15: 連接超時 15 秒
-          # -m 30: 整個請求超時 30 秒
-          # -v: 顯示詳細的傳輸過程 (Verbose)
+          echo "🚀 正在上传 output/base64.txt 到 Cloudflare..."
           
-          curl -v -m 30 --connect-timeout 15 \
-            -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
+          # 直接指定路径，不使用 find，不使用中间变量
+          # -v: 开启详细日志，方便查看连接过程
+          # --data-binary @path: 直接流式传输文件内容
+          curl -v -m 60 --connect-timeout 20 \
+            -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: text/plain" \
-            --data-binary @"$RESULT_FILE"
+            --data-binary @output/base64.txt
 
-          echo -e "\n✅ [流程結束] 如果上面沒有報錯，請檢查 KV 數據。"
+          echo -e "\n🎉 上传流程结束。"
