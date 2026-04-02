@@ -18,31 +18,50 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Run
+      - name: Compile and Run (Smart-Kill Mode)
         run: |
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          
-          # 运行筛选逻辑
-          ./subs-check-bin || true
           mkdir -p output
-          ./subs-check-bin || true
           
-          # 打印内容到日志，方便你直接看
-          if [ -f "output/base64.txt" ]; then
-            echo "=== 节点文件内容预览 ==="
-            cat output/base64.txt
-            echo -e "\n=== 预览结束 ==="
-          fi
+          echo ">>> 启动程序 (后台运行)..."
+          ./subs-check-bin > run.log 2>&1 &
+          APP_PID=$!
+          
+          echo ">>> 监控 output/base64.txt 生成状态..."
+          # 初始状态
+          LAST_SIZE=0
+          STABLE_COUNT=0
+          
+          while true; do
+            if [ -f "output/base64.txt" ]; then
+              CURRENT_SIZE=$(stat -c%s "output/base64.txt")
+              echo "当前文件大小: ${CURRENT_SIZE} 字节"
+              
+              # 如果文件大小 > 1000 字节 (1KB) 且 连续两次检查大小没变化，认为写入完成
+              if [ "$CURRENT_SIZE" -gt 1000 ] && [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
+                STABLE_COUNT=$((STABLE_COUNT + 1))
+              else
+                STABLE_COUNT=0
+              fi
+              
+              if [ "$STABLE_COUNT" -ge 2 ]; then
+                echo "✅ 检测到文件已停止增长，写入完成。"
+                break
+              fi
+              
+              LAST_SIZE=$CURRENT_SIZE
+            fi
+            
+            sleep 20
+            # 顺便打印一下程序最后几行日志，让你知道测速进度
+            tail -n 3 run.log || true
+          done
 
-      # 【新增步骤】将 output 目录打包，供你在 GitHub 页面下载
-      - name: Archive Production Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: node-output-file
-          path: output/base64.txt
-          retention-days: 1 # 仅保留1天，节省空间
+          echo ">>> 强制停止程序..."
+          kill $APP_PID || true
+          sleep 2
 
       - name: Upload to Cloudflare KV
         env:
@@ -50,7 +69,8 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo "🚀 正在同步到 Cloudflare..."
+          echo "🚀 执行最终上传..."
+          # 直接上传二进制文件内容
           curl -v -m 60 --connect-timeout 20 \
             -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
