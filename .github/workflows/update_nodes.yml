@@ -1,14 +1,16 @@
 name: Manual Proxy Update
 
 on:
-  workflow_dispatch: # 删掉了 schedule 定时，改为纯手动触发，防止自动扣费
+  workflow_dispatch: # 保持手动触发，调试稳定前不要开启定时
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # 设置超时时间为 10 分钟，防止程序卡死偷跑配额
-    timeout-minutes: 10 
-    
+    timeout-minutes: 10 # 超过10分钟自动强杀，防止消耗配额
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -17,27 +19,58 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: true
+          cache: false # 禁用缓存，解决你日志里的 tar 报错
 
-      - name: Build and Run
+      - name: Build and Run Go App
         run: |
+          # 1. 准备环境
           mkdir -p output
           go mod tidy
           
-          # 仅尝试一次带参数的编译
-          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=gh-actions" -o proxy_tool .
+          # 2. 编译项目 (注入变量防止 undefined 报错)
+          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=actions" -o proxy_tool .
           
-          # 运行程序，如果 5 分钟没出结果直接杀掉
-          timeout 300s ./proxy_tool || echo "程序运行超时或失败"
+          # 3. 执行程序 (限时5分钟，防止死循环)
+          chmod +x ./proxy_tool
+          timeout 300s ./proxy_tool || echo "程序运行结束或超时"
+          
+          # 4. 打印当前目录结构，方便我们调试找文件
+          echo "--- 运行后的目录结构清单 ---"
+          ls -R
 
-      - name: Upload to CF
-        if: success() # 只有上面成功了才执行上传
+      - name: Upload Result to Cloudflare KV
         run: |
-          RESULT_FILE=$(find output -type f -not -path '*/.*' | head -n 1)
-          if [ -n "$RESULT_FILE" ]; then
-            NODES=$(cat "$RESULT_FILE")
-            curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
-                 -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-                 -H "Content-Type: text/plain" \
-                 --data "$NODES"
+          echo "--- 开始定位结果文件 ---"
+          
+          # 寻找规则：
+          # a. 在当前目录或子目录
+          # b. 文件大小大于 100 字节 (过滤掉空文件)
+          # c. 排除掉 .go, .yml, .md, .mod, .sum 和可执行文件本身
+          RESULT_FILE=$(find . -type f -size +100c \
+            ! -name "*.go" \
+            ! -name "*.yml" \
+            ! -name "*.yaml" \
+            ! -name "*.md" \
+            ! -name "go.mod" \
+            ! -name "go.sum" \
+            ! -name "proxy_tool" \
+            ! -path "./.git/*" \
+            | xargs ls -t | head -n 1)
+
+          if [ -z "$RESULT_FILE" ]; then
+            echo "错误：未能找到任何有效的节点输出文件！请检查 Go 程序是否真的生成了文件。"
+            exit 1
           fi
+
+          echo "找到目标文件: $RESULT_FILE"
+          echo "文件前 5 行预览:"
+          head -n 5 "$RESULT_FILE"
+
+          NODES=$(cat "$RESULT_FILE")
+
+          echo "正在上传到 Cloudflare KV..."
+          # 使用 -v 强制输出 API 返回信息
+          curl -v -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
+               -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+               -H "Content-Type: text/plain" \
+               --data "$NODES"
