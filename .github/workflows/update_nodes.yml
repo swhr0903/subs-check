@@ -6,7 +6,7 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # 将整个 Job 的超时提升到 60 分钟，确保大批量节点能跑完
+    # 给整个任务 60 分钟时间，这是最稳妥的限时方式
     timeout-minutes: 60 
 
     steps:
@@ -19,25 +19,30 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Run
+      - name: Compile and Double-Run
         run: |
-          # 1. 编译
+          # 1. 编译二进制文件
           go mod tidy
-          go build -o subs-check .
-          chmod +x ./subs-check
+          go build -o subs-check-bin .
+          chmod +x ./subs-check-bin
 
-          # 2. 准备输出目录
+          # 2. 第一次运行：初始化/安装阶段
+          # 这一步极其重要！它会在 config 目录下同步配置并初始化数据库
+          echo ">>> 正在执行初始化运行..."
+          ./subs-check-bin || echo "初始化完成（正常退出）"
+
+          # 3. 确保输出目录存在
           mkdir -p output
 
-          # 3. 运行筛选任务
-          echo "开始筛选任务（针对大量节点已延长超时时间）..."
-          # 将 timeout 延长至 45 分钟 (2700s)，预留足够的时间给 1468 个节点
-          timeout 2700s ./subs-check || echo "程序运行结束（可能是正常完成或达到45分钟上限）"
+          # 4. 第二次运行：正式筛选
+          # 这次去掉 shell 层的 timeout，让程序自然运行
+          # GitHub Actions 会根据 job 级别的 timeout-minutes 自动管理
+          echo ">>> 正在执行正式筛选任务（1468个节点，请耐心等待）..."
+          ./subs-check-bin || echo "筛选任务执行结束"
 
-          # 4. 调试：看看生成了什么，特别是 output 文件夹
-          echo "--- 检查 output 目录内容 ---"
+          # 5. 调试：确认文件位置
+          echo "--- 检查目录结构 ---"
           ls -R output/
-          echo "--- 检查当前目录所有新生成文件 ---"
           find . -maxdepth 2 -not -path '*/.*' -size +100c
 
       - name: Upload Result to Cloudflare KV
@@ -46,27 +51,28 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo "--- 定位节点文件 ---"
+          echo "--- 开始提取节点数据 ---"
           
-          # 优先找 output 目录，如果为空则全盘扫描 .txt 或 .yaml
+          # 搜索策略：优先 output 目录，其次根目录下的 .txt 文件
           RESULT_FILE=$(find output -type f -size +100c | head -n 1)
           if [ -z "$RESULT_FILE" ]; then
             RESULT_FILE=$(find . -maxdepth 2 -name "*.txt" -size +100c ! -name "README.md" | head -n 1)
           fi
 
           if [ -z "$RESULT_FILE" ]; then
-            echo "错误：依然未能生成任何有效的节点文件！"
-            echo "提示：请检查 config.yaml 中是否配置了本地保存(save local)。"
+            echo "错误：未能找到生成的节点文件！"
+            echo "当前目录结构如下，供排查："
+            ls -R
             exit 1
           fi
 
-          echo "找到结果文件: $RESULT_FILE"
+          echo "选中文件: $RESULT_FILE"
           NODES=$(cat "$RESULT_FILE")
 
-          echo "正在上传到 Cloudflare..."
+          echo "正在写入 Cloudflare KV..."
           curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
                -H "Authorization: Bearer $CF_API_TOKEN" \
                -H "Content-Type: text/plain" \
                --data "$NODES"
           
-          echo "上传成功！"
+          echo "同步完成！"
