@@ -20,25 +20,29 @@ jobs:
 
       - name: Compile and Run
         run: |
-          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
           
-          # 2. 初始化与运行 (运行两次以确保生成文件)
+          # 运行筛选逻辑
           ./subs-check-bin || true
           mkdir -p output
           ./subs-check-bin || true
           
-          # 3. 验证文件是否存在
+          # 打印内容到日志，方便你直接看
           if [ -f "output/base64.txt" ]; then
-            echo "✅ 成功生成文件: output/base64.txt"
-            ls -lh output/base64.txt
-          else
-            echo "❌ 错误：output/base64.txt 未生成！"
-            ls -R
-            exit 1
+            echo "=== 节点文件内容预览 ==="
+            cat output/base64.txt
+            echo -e "\n=== 预览结束 ==="
           fi
+
+      # 【新增步骤】将 output 目录打包，供你在 GitHub 页面下载
+      - name: Archive Production Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-output-file
+          path: output/base64.txt
+          retention-days: 1 # 仅保留1天，节省空间
 
       - name: Upload to Cloudflare KV
         env:
@@ -46,15 +50,9 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo "🚀 正在上传 output/base64.txt 到 Cloudflare..."
-          
-          # 直接指定路径，不使用 find，不使用中间变量
-          # -v: 开启详细日志，方便查看连接过程
-          # --data-binary @path: 直接流式传输文件内容
+          echo "🚀 正在同步到 Cloudflare..."
           curl -v -m 60 --connect-timeout 20 \
             -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: text/plain" \
             --data-binary @output/base64.txt
-
-          echo -e "\n🎉 上传流程结束。"
