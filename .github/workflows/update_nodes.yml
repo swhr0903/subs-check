@@ -1,17 +1,14 @@
 name: Manual Proxy Update
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
-
-env:
-  # 适配 2026 年 GitHub Actions 强制 Node.js 24 的要求
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  workflow_dispatch: # 删掉了 schedule 定时，改为纯手动触发，防止自动扣费
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
+    # 设置超时时间为 10 分钟，防止程序卡死偷跑配额
+    timeout-minutes: 10 
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,42 +16,28 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '>=1.21'
+          go-version: '1.21'
           cache: true
 
-      - name: Run Go App
+      - name: Build and Run
         run: |
           mkdir -p output
           go mod tidy
           
-          # 【核心修复】使用通配符编译所有子目录，并手动注入缺失的变量
-          # 既然它报 Version 未定义，我们就直接在编译时塞给它两个假的值
-          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=github-actions" -o proxy_tool . || \
-          go build -o proxy_tool ./... || \
-          go run ./... || true
+          # 仅尝试一次带参数的编译
+          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=gh-actions" -o proxy_tool .
           
-          # 运行程序
-          chmod +x ./proxy_tool 2>/dev/null || true
-          ./proxy_tool || go run main.go || echo "Attempting fallback run..."
+          # 运行程序，如果 5 分钟没出结果直接杀掉
+          timeout 300s ./proxy_tool || echo "程序运行超时或失败"
 
-      - name: Upload Result to Cloudflare KV
+      - name: Upload to CF
+        if: success() # 只有上面成功了才执行上传
         run: |
-          echo "Listing output files for debug:"
-          ls -R output/
-          
-          # 自动寻找 output 文件夹下任何非空文件
           RESULT_FILE=$(find output -type f -not -path '*/.*' | head -n 1)
-          
           if [ -n "$RESULT_FILE" ]; then
-            echo "Uploading $RESULT_FILE..."
             NODES=$(cat "$RESULT_FILE")
-            
             curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
                  -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                  -H "Content-Type: text/plain" \
                  --data "$NODES"
-            echo "Successfully uploaded!"
-          else
-            echo "Critical Error: No output file generated!"
-            exit 1
           fi
