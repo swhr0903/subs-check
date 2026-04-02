@@ -6,7 +6,8 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 将整个 Job 的超时提升到 60 分钟，确保大批量节点能跑完
+    timeout-minutes: 60 
 
     steps:
       - name: Checkout code
@@ -18,39 +19,26 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Double-Run
+      - name: Compile and Run
         run: |
-          # 1. 编译程序
+          # 1. 编译
           go mod tidy
-          # 编译出的二进制文件名设为 subs-check
           go build -o subs-check .
           chmod +x ./subs-check
 
-          # 2. 第一次运行：初始化/安装阶段
-          # 这一步是为了让程序生成必要的初始文件或配置映射
-          echo "执行第一次运行（初始化）..."
-          ./subs-check || echo "第一次运行结束（预期内）"
-
-          # 3. 配置准备阶段
-          # 如果你的仓库里已经有 config.yaml，我们强制覆盖掉自动生成的，确保有源
-          if [ -f "config/config.yaml" ]; then
-            echo "发现仓库配置，正在应用..."
-          else
-            echo "警告：未发现 config.yaml，尝试使用示例配置..."
-            cp config/config.example.yaml config/config.yaml
-          fi
-          
-          # 关键点：确保 output 目录存在
+          # 2. 准备输出目录
           mkdir -p output
 
-          # 4. 第二次运行：真正的筛选阶段
-          echo "执行第二次运行（筛选任务）..."
-          # 使用 timeout 防止测速卡死。如果你的节点很多，可以把 300s 改长
-          timeout 600s ./subs-check || echo "筛选任务执行完毕"
+          # 3. 运行筛选任务
+          echo "开始筛选任务（针对大量节点已延长超时时间）..."
+          # 将 timeout 延长至 45 分钟 (2700s)，预留足够的时间给 1468 个节点
+          timeout 2700s ./subs-check || echo "程序运行结束（可能是正常完成或达到45分钟上限）"
 
-          # 5. 调试：全量搜索生成的文件
-          echo "--- 扫描所有生成的文件（不仅限于 output） ---"
-          find . -maxdepth 3 -not -path '*/.*'
+          # 4. 调试：看看生成了什么，特别是 output 文件夹
+          echo "--- 检查 output 目录内容 ---"
+          ls -R output/
+          echo "--- 检查当前目录所有新生成文件 ---"
+          find . -maxdepth 2 -not -path '*/.*' -size +100c
 
       - name: Upload Result to Cloudflare KV
         env:
@@ -60,18 +48,15 @@ jobs:
         run: |
           echo "--- 定位节点文件 ---"
           
-          # 根据你的项目目录，结果通常在 output/ 目录下
-          # 我们寻找大小超过 100 字节且不是 .go/.md 的文件
+          # 优先找 output 目录，如果为空则全盘扫描 .txt 或 .yaml
           RESULT_FILE=$(find output -type f -size +100c | head -n 1)
-
-          # 如果 output 还是空的，我们扩大搜索范围到根目录下的 .txt 或 .sub 文件
           if [ -z "$RESULT_FILE" ]; then
-            RESULT_FILE=$(find . -maxdepth 2 -name "*.txt" -size +100c | head -n 1)
+            RESULT_FILE=$(find . -maxdepth 2 -name "*.txt" -size +100c ! -name "README.md" | head -n 1)
           fi
 
           if [ -z "$RESULT_FILE" ]; then
             echo "错误：依然未能生成任何有效的节点文件！"
-            echo "请检查 config/config.yaml 里的 'subs:' 部分是否填入了有效的订阅链接。"
+            echo "提示：请检查 config.yaml 中是否配置了本地保存(save local)。"
             exit 1
           fi
 
