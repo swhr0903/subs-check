@@ -18,28 +18,49 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Run (Smart-Kill Mode)
+      - name: Build and Fix Config
         run: |
+          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          mkdir -p output
           
+          # 2. 关键：强行准备好配置文件目录
+          # 确保程序启动时直接就能看到 config/config.yaml，不触发它的初始化逻辑
+          mkdir -p config
+          if [ -f "config.yaml" ]; then
+            cp config.yaml config/config.yaml
+          elif [ -f "config/config.yaml" ]; then
+            echo "Config already in place."
+          else
+            # 如果仓库里只有 example，就改名，确保程序不报错
+            cp config/config.example.yaml config/config.yaml || echo "No config found"
+          fi
+          
+          mkdir -p output
+
+      - name: Smart Run and Upload
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+        run: |
           echo ">>> 启动程序 (后台运行)..."
-          ./subs-check-bin > run.log 2>&1 &
+          # 使用绝对路径运行，防止相对路径丢失
+          CUR_DIR=$(pwd)
+          $CUR_DIR/subs-check-bin > run.log 2>&1 &
           APP_PID=$!
           
-          echo ">>> 监控 output/base64.txt 生成状态..."
-          # 初始状态
+          echo ">>> 监控 output/base64.txt..."
           LAST_SIZE=0
           STABLE_COUNT=0
           
-          while true; do
+          # 循环监控
+          for i in {1..120}; do
             if [ -f "output/base64.txt" ]; then
               CURRENT_SIZE=$(stat -c%s "output/base64.txt")
-              echo "当前文件大小: ${CURRENT_SIZE} 字节"
+              echo "文件大小: ${CURRENT_SIZE} 字节"
               
-              # 如果文件大小 > 1000 字节 (1KB) 且 连续两次检查大小没变化，认为写入完成
               if [ "$CURRENT_SIZE" -gt 1000 ] && [ "$CURRENT_SIZE" -eq "$LAST_SIZE" ]; then
                 STABLE_COUNT=$((STABLE_COUNT + 1))
               else
@@ -47,30 +68,21 @@ jobs:
               fi
               
               if [ "$STABLE_COUNT" -ge 2 ]; then
-                echo "✅ 检测到文件已停止增长，写入完成。"
+                echo "✅ 写入完成！"
                 break
               fi
-              
               LAST_SIZE=$CURRENT_SIZE
             fi
             
             sleep 20
-            # 顺便打印一下程序最后几行日志，让你知道测速进度
+            # 打印日志最后 3 行，确认它没在死循环创建配置
             tail -n 3 run.log || true
           done
 
-          echo ">>> 强制停止程序..."
+          echo ">>> 停止程序并上传..."
           kill $APP_PID || true
-          sleep 2
-
-      - name: Upload to Cloudflare KV
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-        run: |
-          echo "🚀 执行最终上传..."
-          # 直接上传二进制文件内容
+          
+          # 执行上传
           curl -v -m 60 --connect-timeout 20 \
             -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
