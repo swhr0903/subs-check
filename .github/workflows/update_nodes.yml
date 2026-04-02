@@ -3,9 +3,6 @@ name: Manual Proxy Update
 on:
   workflow_dispatch: # 手动触发
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
@@ -15,57 +12,54 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Step 1: 模拟安装过程
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      - name: Install and Run
         run: |
-          # 1. 给安装脚本权限并执行 (假设脚本叫 install.sh)
-          # 注意：因为 sudo 会尝试开启服务，Action 环境没 systemd，我们忽略报错
+          # 1. 确保安装脚本有执行权限并运行它
+          # 如果脚本名不是 install.sh，请修改下面这一行
           chmod +x install.sh
-          sudo ./install.sh || echo "安装脚本运行结束（忽略服务启动失败）"
-          
-          # 2. 补齐安装脚本可能没创建的目录
-          sudo mkdir -p /opt/subs-check/output
-          sudo mkdir -p /opt/subs-check/config
-          
-          # 3. 将仓库里的配置文件覆盖到安装目录（确保程序有源可扫）
-          if [ -d "config" ]; then
-            sudo cp -r config/* /opt/subs-check/config/
-          fi
+          ./install.sh || echo "Install script finished"
 
-      - name: Step 2: 运行筛选程序
-        run: |
-          cd /opt/subs-check
-          # 运行安装好的二进制文件
-          # 加上 timeout 防止程序测速太慢导致不停止
-          sudo timeout 300s ./subs-check || echo "程序运行结束"
+          # 2. 这里的关键：subs-check 安装后通常在根目录或 bin 下
+          # 我们尝试在当前目录编译并运行，确保能读到仓库里的 config 文件夹
+          go mod tidy
+          go build -ldflags "-X main.Version=1.0.0" -o subs-check-bin .
           
-          # 检查结果到底在哪
-          echo "--- 调试：查看安装目录下的文件变动 ---"
-          ls -R /opt/subs-check/
+          # 3. 运行程序，程序会自动读取当前目录下的 config/config.yaml
+          # 并默认在 output/ 目录下生成文件
+          mkdir -p output
+          ./subs-check-bin || echo "Execution finished"
+          
+          # 4. 调试：看看到底生成了什么文件
+          echo "--- Files in output directory ---"
+          ls -R output/
 
-      - name: Step 3: 上传到 Cloudflare KV
+      - name: Upload to Cloudflare KV
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo "--- 正在从安装目录提取结果 ---"
-          
-          # 在安装后的目录里寻找最新生成的节点文件
-          # 排除程序本身、脚本和配置文件
-          RESULT_FILE=$(find /opt/subs-check -type f \
-            ! -name "subs-check" \
-            ! -name "*.sh" \
-            ! -name "*.yaml" \
-            ! -name "*.yml" \
-            ! -name "*.service" \
-            -size +100c | xargs ls -t | head -n 1)
+          # 寻找 output 目录下大小超过 100 字节的第一个非隐藏文件
+          RESULT_FILE=$(find output -type f -size +100c | head -n 1)
 
           if [ -z "$RESULT_FILE" ]; then
-            echo "失败：安装目录下未找到生成的节点文件！"
+            echo "Error: No valid node file found in output/ directory."
             exit 1
           fi
 
-          echo "定位到目标文件: $RESULT_FILE"
+          echo "Found result file: $RESULT_FILE"
           NODES=$(cat "$RESULT_FILE")
 
-          echo "正在上传到 Cloudflare KV..."
-          curl -v -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
-               -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+          # 执行上传
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
+               -H "Authorization: Bearer $CF_API_TOKEN" \
                -H "Content-Type: text/plain" \
                --data "$NODES"
+          
+          echo "Successfully uploaded to Cloudflare KV!"
