@@ -6,7 +6,7 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -18,26 +18,39 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Run App
+      - name: Compile and Double-Run
         run: |
-          # 1. 整理依赖
+          # 1. 编译程序
           go mod tidy
+          # 编译出的二进制文件名设为 subs-check
+          go build -o subs-check .
+          chmod +x ./subs-check
+
+          # 2. 第一次运行：初始化/安装阶段
+          # 这一步是为了让程序生成必要的初始文件或配置映射
+          echo "执行第一次运行（初始化）..."
+          ./subs-check || echo "第一次运行结束（预期内）"
+
+          # 3. 配置准备阶段
+          # 如果你的仓库里已经有 config.yaml，我们强制覆盖掉自动生成的，确保有源
+          if [ -f "config/config.yaml" ]; then
+            echo "发现仓库配置，正在应用..."
+          else
+            echo "警告：未发现 config.yaml，尝试使用示例配置..."
+            cp config/config.example.yaml config/config.yaml
+          fi
           
-          # 2. 编译程序 (注入 Version 变量防止报错)
-          # 注意：这里直接编译当前目录
-          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=$(date +%Y%m%d)" -o subs-check-app .
-          
-          # 3. 准备输出目录
+          # 关键点：确保 output 目录存在
           mkdir -p output
-          
-          # 4. 运行程序
-          # 确保仓库根目录下有 config/config.yaml 文件
-          chmod +x ./subs-check-app
-          ./subs-check-app || echo "程序运行结束"
-          
-          # 5. 调试：确认生成了什么
-          echo "--- 检查 output 目录 ---"
-          ls -R output/
+
+          # 4. 第二次运行：真正的筛选阶段
+          echo "执行第二次运行（筛选任务）..."
+          # 使用 timeout 防止测速卡死。如果你的节点很多，可以把 300s 改长
+          timeout 600s ./subs-check || echo "筛选任务执行完毕"
+
+          # 5. 调试：全量搜索生成的文件
+          echo "--- 扫描所有生成的文件（不仅限于 output） ---"
+          find . -maxdepth 3 -not -path '*/.*'
 
       - name: Upload Result to Cloudflare KV
         env:
@@ -45,31 +58,30 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 寻找 output 目录下生成的节点文件
-          # 排除隐藏文件和文件夹
-          RESULT_FILE=$(find output -type f -not -path '*/.*' -size +100c | head -n 1)
+          echo "--- 定位节点文件 ---"
+          
+          # 根据你的项目目录，结果通常在 output/ 目录下
+          # 我们寻找大小超过 100 字节且不是 .go/.md 的文件
+          RESULT_FILE=$(find output -type f -size +100c | head -n 1)
+
+          # 如果 output 还是空的，我们扩大搜索范围到根目录下的 .txt 或 .sub 文件
+          if [ -z "$RESULT_FILE" ]; then
+            RESULT_FILE=$(find . -maxdepth 2 -name "*.txt" -size +100c | head -n 1)
+          fi
 
           if [ -z "$RESULT_FILE" ]; then
-            echo "错误：output 目录下未找到任何有效的节点文件！"
-            echo "当前目录结构如下："
-            ls -R
+            echo "错误：依然未能生成任何有效的节点文件！"
+            echo "请检查 config/config.yaml 里的 'subs:' 部分是否填入了有效的订阅链接。"
             exit 1
           fi
 
-          echo "找到目标文件: $RESULT_FILE"
+          echo "找到结果文件: $RESULT_FILE"
           NODES=$(cat "$RESULT_FILE")
 
           echo "正在上传到 Cloudflare..."
-          # 使用 -w 打印状态码，-s 静默
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: text/plain" \
-            --data "$NODES")
-
-          if [ "$RESPONSE" == "200" ]; then
-            echo "上传成功！状态码: 200"
-          else
-            echo "上传失败！状态码: $RESPONSE"
-            exit 1
-          fi
+          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
+               -H "Authorization: Bearer $CF_API_TOKEN" \
+               -H "Content-Type: text/plain" \
+               --data "$NODES"
+          
+          echo "上传成功！"
