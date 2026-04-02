@@ -6,7 +6,6 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # 给整体任务 60 分钟上限，防止 main.go 逻辑失效
     timeout-minutes: 60 
 
     steps:
@@ -19,27 +18,45 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Build and Setup Config
+      - name: Build and Force Config
         run: |
-          # 1. 编译你修改过 main.go 后的程序
+          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
           
-          # 2. 准备配置环境 (确保程序启动不报 "请编辑配置文件")
+          # 2. 获取当前绝对路径
+          WORKSPACE=$(pwd)
+          echo "Current Workspace: $WORKSPACE"
+          
+          # 3. 强制清理并重建配置目录
+          rm -rf config
           mkdir -p config
-          if [ -f "config/config.yaml" ]; then
-            cp config/config.yaml ./config.yaml
-          elif [ -f "config.yaml" ]; then
+          
+          # 4. 寻找并拷贝配置文件（无论它在根目录还是 config 目录）
+          if [ -f "config.yaml" ]; then
             cp config.yaml config/config.yaml
+          elif [ -f "config/config.yaml" ]; then
+            # 如果原本就在 config/ 下，先移出来再拷进去确保刷新
+            cp config/config.yaml ./temp_config.yaml
+            cp ./temp_config.yaml config/config.yaml
           fi
           
-          mkdir -p output
+          # 5. 验证配置文件确实存在于程序预期的位置
+          if [ -f "$WORKSPACE/config/config.yaml" ]; then
+            echo "✅ 配置文件已锁定: $WORKSPACE/config/config.yaml"
+            # 打印前几行（隐藏敏感信息）确认文件内容不是空的
+            head -n 5 config/config.yaml
+          else
+            echo "❌ 严重错误：未能准备好配置文件"
+            exit 1
+          fi
 
       - name: Execute Filter
         run: |
-          # 运行编译好的二进制文件
-          # 此时 main.go 会在检测到 base64.txt 生成后自动 exit 0
+          # 运行程序
+          # 此时程序会读取 ./config/config.yaml
+          # 运行完成后，你修改过的 main.go 会检测到文件并 exit 0
           ./subs-check-bin
 
       - name: Upload Result to Cloudflare KV
@@ -48,9 +65,9 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 只有上一步 ./subs-check-bin 正常退出后，才会执行到这里
+          # 检查 output/base64.txt 是否生成
           if [ -f "output/base64.txt" ]; then
-            echo "✅ 节点检测完成，开始同步到 Cloudflare KV..."
+            echo "🚀 发现节点文件，开始上传到 KV..."
             
             curl -v -m 60 --connect-timeout 20 \
               -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
@@ -58,16 +75,20 @@ jobs:
               -H "Content-Type: text/plain" \
               --data-binary @output/base64.txt
               
-            echo -e "\n🎉 同步成功！"
+            echo -e "\n🎉 KV 同步完成！"
           else
-            echo "❌ 失败：未能在 output 目录下找到 base64.txt"
+            echo "❌ 错误：output/base64.txt 未生成，请检查程序日志。"
+            # 列出目录结构方便调试
+            ls -R
             exit 1
           fi
 
-      - name: Archive Results
+      - name: Archive Debug Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: node-results
-          path: output/
-          retention-days: 1
+          name: debug-files
+          path: |
+            output/
+            config/
+            *.log
