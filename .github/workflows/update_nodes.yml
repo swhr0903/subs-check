@@ -1,7 +1,7 @@
 name: Manual Proxy Update
 
 on:
-  workflow_dispatch: # 保持手动触发，调试稳定前不要开启定时
+  workflow_dispatch: # 手动触发
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -9,7 +9,7 @@ env:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10 # 超过10分钟自动强杀，防止消耗配额
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -19,7 +19,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: false # 禁用缓存，解决你日志里的 tar 报错
+          cache: false
 
       - name: Build and Run Go App
         run: |
@@ -27,49 +27,45 @@ jobs:
           mkdir -p output
           go mod tidy
           
-          # 2. 编译项目 (注入变量防止 undefined 报错)
-          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=actions" -o proxy_tool .
+          # 2. 编译项目 (针对 subs-check 特色注入变量)
+          go build -ldflags "-X main.Version=1.0.0 -X main.CurrentCommit=$(date +%Y%m%d)" -o proxy_tool .
           
-          # 3. 执行程序 (限时5分钟，防止死循环)
+          # 3. 执行程序 (限时5分钟)
+          # 注意：请确保你的仓库里有 config 文件夹及其 yaml 配置文件
           chmod +x ./proxy_tool
-          timeout 300s ./proxy_tool || echo "程序运行结束或超时"
+          ./proxy_tool || echo "程序运行可能未生成文件"
           
-          # 4. 打印当前目录结构，方便我们调试找文件
-          echo "--- 运行后的目录结构清单 ---"
-          ls -R
+          # 4. 打印目录，确认文件到底生成在哪了
+          echo "--- 调试：列出 output 目录内容 ---"
+          ls -R output/
 
       - name: Upload Result to Cloudflare KV
         run: |
-          echo "--- 开始定位结果文件 ---"
+          echo "--- 正在定位真正的节点文件 ---"
           
-          # 寻找规则：
-          # a. 在当前目录或子目录
-          # b. 文件大小大于 100 字节 (过滤掉空文件)
-          # c. 排除掉 .go, .yml, .md, .mod, .sum 和可执行文件本身
-          RESULT_FILE=$(find . -type f -size +100c \
+          # 严格限制：只在 output 文件夹寻找，且排除 .sh, .go 等非节点文件
+          RESULT_FILE=$(find output -type f \
+            ! -name "*.sh" \
             ! -name "*.go" \
-            ! -name "*.yml" \
             ! -name "*.yaml" \
-            ! -name "*.md" \
-            ! -name "go.mod" \
-            ! -name "go.sum" \
-            ! -name "proxy_tool" \
-            ! -path "./.git/*" \
-            | xargs ls -t | head -n 1)
+            ! -name "*.yml" \
+            | head -n 1)
 
           if [ -z "$RESULT_FILE" ]; then
-            echo "错误：未能找到任何有效的节点输出文件！请检查 Go 程序是否真的生成了文件。"
+            echo "失败：在 output 文件夹内没找到任何节点文件！"
+            echo "可能是程序没跑成功，或者是 config 里的路径配置不对。"
             exit 1
           fi
 
-          echo "找到目标文件: $RESULT_FILE"
-          echo "文件前 5 行预览:"
-          head -n 5 "$RESULT_FILE"
-
+          echo "定位到目标文件: $RESULT_FILE"
           NODES=$(cat "$RESULT_FILE")
 
+          if [[ "$NODES" == *"#!"* ]]; then
+            echo "检测到上传内容疑似脚本，已拦截！"
+            exit 1
+          fi
+
           echo "正在上传到 Cloudflare KV..."
-          # 使用 -v 强制输出 API 返回信息
           curl -v -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/all_nodes" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: text/plain" \
