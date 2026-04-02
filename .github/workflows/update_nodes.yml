@@ -6,7 +6,7 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60 
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -20,60 +20,52 @@ jobs:
 
       - name: Compile and Setup
         run: |
-          # 1. 編譯程序
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          
-          # 2. 強制配置環境
-          # 確保根目錄和 config 目錄下都有配置文件，防止程序找不到
+          # 建立双重配置路径，防止程序找不到 config.yaml
           mkdir -p config
-          if [ -f "config/config.yaml" ]; then
-            cp config/config.yaml ./config.yaml
-          elif [ -f "config.yaml" ]; then
-            cp config.yaml config/config.yaml
+          if [ -d "config" ] && [ -f "config/config.yaml" ]; then
+            cp config/config.yaml ./config.yaml || true
           fi
 
-      - name: Step 1: Initialize (First Run)
-        run: |
-          # 第一次運行：完成你說的「安裝」或初始化
-          # 即使報錯也繼續，因為它可能只是因為端口佔用或沒有執行完
-          ./subs-check-bin || echo "Initialization phase finished."
-          sleep 5
-
-      - name: Step 2: Filter and Upload (Second Run)
+      - name: Run Filter and Upload
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 1. 後台啟動程序執行真正的篩選
-          echo ">>> 啟動正式篩選任務..."
+          # 1. 第一次运行：完成初始化
+          echo ">>> 正在执行初始化阶段..."
+          ./subs-check-bin || echo "Init process finished"
+          sleep 5
+
+          # 2. 第二次运行：后台执行正式筛选
+          echo ">>> 启动正式筛选任务 (后台模式)..."
           ./subs-check-bin > run.log 2>&1 &
           
-          # 2. 監控文件生成
-          echo ">>> 正在監控 output/base64.txt..."
-          for i in {1..180}; do
-            # 檢查文件是否存在且大小大於 1KB (1024字節)
-            if [ -f "output/base64.txt" ] && [ $(stat -c%s "output/base64.txt") -gt 1024 ]; then
-              echo "✅ 文件生成成功，準備同步到 Cloudflare..."
+          # 3. 监控 output/base64.txt 是否生成
+          echo ">>> 监控文件生成中..."
+          for i in {1..150}; do
+            # 检查文件是否存在且大小大于 1000 字节
+            if [ -f "output/base64.txt" ] && [ $(stat -c%s "output/base64.txt") -gt 1000 ]; then
+              echo "✅ 检测到节点文件生成成功，准备同步到 Cloudflare..."
               
-              # 3. 執行同步
+              # 执行上传 (使用二进制流上传，最稳)
               curl -s -v -m 60 --connect-timeout 20 \
                 -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
                 -H "Authorization: Bearer ${CF_API_TOKEN}" \
                 -H "Content-Type: text/plain" \
                 --data-binary @output/base64.txt
               
-              echo "🎉 同步完成，強制結束任務。"
+              echo -e "\n🎉 同步完成，任务结束。"
               exit 0
             fi
             
-            # 每 20 秒檢查一次，並輸出日誌最後一行
             sleep 20
-            echo "--- 程序最新日誌 ---"
+            # 打印最后一行日志防止控制台超时
             tail -n 1 run.log || true
           done
 
-          echo "❌ 逾時：未能在預定時間內生成節點文件。"
+          echo "❌ 失败：在 50 分钟内未生成节点文件。"
           exit 1
