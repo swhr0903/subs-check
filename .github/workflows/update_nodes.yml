@@ -1,17 +1,15 @@
 name: Scheduled Proxy Update
 
 on:
-  workflow_dispatch: # 保留手动触发，方便调试
+  workflow_dispatch: # 保留手动触发按钮
   schedule:
-    # 每 12 小时执行一次 (UTC 时间 0:00 和 12:00)
-    # 对应北京时间 8:00 和 20:00
-    - cron: '0 */12 * * *'
+    # 北京时间每天 08:00 和 20:00 执行 (对应 UTC 0:00 和 12:00)
+    - cron: '0 0,12 * * *'
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # 设置超时，防止程序卡死消耗 GitHub 额度
-    timeout-minutes: 50 
+    timeout-minutes: 60 
 
     steps:
       - name: Checkout code
@@ -21,23 +19,33 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: true # 开启缓存，加快构建速度，节省 Action 时间
+          # --- 核心修复：移除 cache 避免 tar 解压冲突 ---
+          cache: false 
 
-      - name: Build and Locate Config
+      - name: Build and Setup
         run: |
+          # 1. 编译 (关闭缓存后会重新下载依赖，虽然慢几十秒但最稳)
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
+          
+          # 2. 准备配置目录
           mkdir -p config
-          # 自动寻找配置逻辑保持不变
+          mkdir -p output
+          
+          # 3. 搜索并放置配置文件
           REAL_CONFIG=$(find . -name "config.yaml" | head -n 1)
           if [ -n "$REAL_CONFIG" ]; then
             cp "$REAL_CONFIG" config/config.yaml
+            echo "✅ 使用配置文件: $REAL_CONFIG"
+          else
+            echo "❌ 未找到 config.yaml"
+            exit 1
           fi
 
       - name: Execute Filter
         run: |
-          # 确保你已经使用了之前修改过的带 os.Exit(0) 的 main.go
+          # 运行你修改过 main.go 的程序
           ./subs-check-bin
 
       - name: Upload Result to Cloudflare KV
@@ -46,12 +54,17 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          if [ -f "output/base64.txt" ]; then
-            # 只有当文件存在且不为空时才上传，节省 KV 写入次数
-            [ -s "output/base64.txt" ] || exit 1
+          if [ -s "output/base64.txt" ]; then
+            echo "🚀 节点生成成功 (大小: $(stat -c%s output/base64.txt) 字节)，开始同步..."
             
-            curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
+            # 使用 -s 保持静默，-S 显示错误，减少日志冗余
+            curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
               --data-binary @output/base64.txt
+              
+            echo -e "\n🎉 同步完成！"
+          else
+            echo "⚠️ 警告：output/base64.txt 为空或不存在，跳过上传。"
+            exit 1
           fi
