@@ -6,7 +6,6 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    # 给整个任务 60 分钟时间，这是最稳妥的限时方式
     timeout-minutes: 60 
 
     steps:
@@ -19,60 +18,44 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Double-Run
+      - name: Compile and Run
         run: |
-          # 1. 编译二进制文件
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-
-          # 2. 第一次运行：初始化/安装阶段
-          # 这一步极其重要！它会在 config 目录下同步配置并初始化数据库
-          echo ">>> 正在执行初始化运行..."
-          ./subs-check-bin || echo "初始化完成（正常退出）"
-
-          # 3. 确保输出目录存在
+          # 第一次運行初始化
+          ./subs-check-bin || true
           mkdir -p output
+          # 第二次運行篩選
+          ./subs-check-bin || true
+          echo "--- 檢查 output 目錄 ---"
+          ls -lh output/
 
-          # 4. 第二次运行：正式筛选
-          # 这次去掉 shell 层的 timeout，让程序自然运行
-          # GitHub Actions 会根据 job 级别的 timeout-minutes 自动管理
-          echo ">>> 正在执行正式筛选任务（1468个节点，请耐心等待）..."
-          ./subs-check-bin || echo "筛选任务执行结束"
-
-          # 5. 调试：确认文件位置
-          echo "--- 检查目录结构 ---"
-          ls -R output/
-          find . -maxdepth 2 -not -path '*/.*' -size +100c
-
-      - name: Upload Result to Cloudflare KV
+      - name: Upload to Cloudflare (Debug Mode)
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          echo "--- 开始提取节点数据 ---"
-          
-          # 搜索策略：优先 output 目录，其次根目录下的 .txt 文件
-          RESULT_FILE=$(find output -type f -size +100c | head -n 1)
+          # 1. 定位文件
+          RESULT_FILE=$(find output -type f -size +1k | head -n 1)
           if [ -z "$RESULT_FILE" ]; then
-            RESULT_FILE=$(find . -maxdepth 2 -name "*.txt" -size +100c ! -name "README.md" | head -n 1)
-          fi
-
-          if [ -z "$RESULT_FILE" ]; then
-            echo "错误：未能找到生成的节点文件！"
-            echo "当前目录结构如下，供排查："
-            ls -R
+            echo "❌ [錯誤] 未找到結果文件，請檢查上面步驟的輸出。"
             exit 1
           fi
 
-          echo "选中文件: $RESULT_FILE"
-          NODES=$(cat "$RESULT_FILE")
+          echo "🚀 [開始上傳] 文件路徑: $RESULT_FILE"
+          echo "📏 文件大小: $(du -h "$RESULT_FILE" | cut -f1)"
 
-          echo "正在写入 Cloudflare KV..."
-          curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
-               -H "Authorization: Bearer $CF_API_TOKEN" \
-               -H "Content-Type: text/plain" \
-               --data "$NODES"
+          # 2. 執行上傳 (去掉 -s，增加詳細日誌)
+          # --connect-timeout 15: 連接超時 15 秒
+          # -m 30: 整個請求超時 30 秒
+          # -v: 顯示詳細的傳輸過程 (Verbose)
           
-          echo "同步完成！"
+          curl -v -m 30 --connect-timeout 15 \
+            -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/all_nodes" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @"$RESULT_FILE"
+
+          echo -e "\n✅ [流程結束] 如果上面沒有報錯，請檢查 KV 數據。"
