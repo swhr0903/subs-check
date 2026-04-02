@@ -1,12 +1,17 @@
-name: Manual Proxy Update
+name: Scheduled Proxy Update
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 保留手动触发，方便调试
+  schedule:
+    # 每 12 小时执行一次 (UTC 时间 0:00 和 12:00)
+    # 对应北京时间 8:00 和 20:00
+    - cron: '0 */12 * * *'
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60 
+    # 设置超时，防止程序卡死消耗 GitHub 额度
+    timeout-minutes: 50 
 
     steps:
       - name: Checkout code
@@ -16,51 +21,23 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: false
+          cache: true # 开启缓存，加快构建速度，节省 Action 时间
 
       - name: Build and Locate Config
         run: |
-          # 1. 编译
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          
-          # 2. 准备配置目录
           mkdir -p config
-          
-          # 3. 全盘搜索 config.yaml 或 config.example.yaml
-          echo "🔍 正在仓库中寻找配置文件..."
-          # 优先找真正的 config.yaml
+          # 自动寻找配置逻辑保持不变
           REAL_CONFIG=$(find . -name "config.yaml" | head -n 1)
-          
           if [ -n "$REAL_CONFIG" ]; then
-            echo "✅ 找到配置文件: $REAL_CONFIG"
             cp "$REAL_CONFIG" config/config.yaml
-          else
-            echo "⚠️ 未找到 config.yaml，尝试查找 example 文件..."
-            EXAMPLE_CONFIG=$(find . -name "config.example.yaml" | head -n 1)
-            if [ -n "$EXAMPLE_CONFIG" ]; then
-              echo "✅ 使用示例文件作为配置: $EXAMPLE_CONFIG"
-              cp "$EXAMPLE_CONFIG" config/config.yaml
-            else
-              echo "❌ 严重错误：仓库中没有任何 .yaml 配置文件！"
-              ls -R
-              exit 1
-            fi
-          fi
-          
-          # 4. 最终验证
-          if [ -f "config/config.yaml" ]; then
-            echo "🚀 配置文件准备就绪，路径: $(pwd)/config/config.yaml"
-          else
-            exit 1
           fi
 
       - name: Execute Filter
         run: |
-          # 运行程序
-          # 此时它会读取 ./config/config.yaml
-          # 运行完成后，你修改过的 main.go 会检测到文件并 exit 0
+          # 确保你已经使用了之前修改过的带 os.Exit(0) 的 main.go
           ./subs-check-bin
 
       - name: Upload Result to Cloudflare KV
@@ -70,14 +47,11 @@ jobs:
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
           if [ -f "output/base64.txt" ]; then
-            echo "🚀 发现节点文件，开始上传..."
-            curl -v -m 60 --connect-timeout 20 \
-              -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
+            # 只有当文件存在且不为空时才上传，节省 KV 写入次数
+            [ -s "output/base64.txt" ] || exit 1
+            
+            curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
               --data-binary @output/base64.txt
-          else
-            echo "❌ 错误：output/base64.txt 未生成"
-            ls -R
-            exit 1
           fi
