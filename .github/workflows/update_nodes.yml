@@ -6,7 +6,8 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 给整体任务 60 分钟上限，防止 main.go 逻辑失效
+    timeout-minutes: 60 
 
     steps:
       - name: Checkout code
@@ -18,24 +19,28 @@ jobs:
           go-version: '1.21'
           cache: false
 
-      - name: Compile and Setup
+      - name: Build and Setup Config
         run: |
+          # 1. 编译你修改过 main.go 后的程序
           go mod tidy
           go build -o subs-check-bin .
           chmod +x ./subs-check-bin
-          # 确保配置文件夹存在，并拷贝配置
-          mkdir -p config
-          [ -f "config/config.yaml" ] && cp config/config.yaml ./config.yaml || true
-
-      - name: Run Filter (With Hard Timeout)
-        run: |
-          # 第一次运行：初始化（如果需要）
-          ./subs-check-bin || echo "Init stage finished"
           
-          # 第二次运行：正式筛选
-          # 使用 timeout 45m。程序跑完后会卡住，45分钟后 timeout 会杀掉它并继续下一步
-          echo ">>> 开始测速筛选，预计运行 45 分钟..."
-          timeout 45m ./subs-check-bin || echo "Reach timeout or finished"
+          # 2. 准备配置环境 (确保程序启动不报 "请编辑配置文件")
+          mkdir -p config
+          if [ -f "config/config.yaml" ]; then
+            cp config/config.yaml ./config.yaml
+          elif [ -f "config.yaml" ]; then
+            cp config.yaml config/config.yaml
+          fi
+          
+          mkdir -p output
+
+      - name: Execute Filter
+        run: |
+          # 运行编译好的二进制文件
+          # 此时 main.go 会在检测到 base64.txt 生成后自动 exit 0
+          ./subs-check-bin
 
       - name: Upload Result to Cloudflare KV
         env:
@@ -43,17 +48,26 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
         run: |
-          # 运行到这里时，程序已经被 timeout 杀掉了
+          # 只有上一步 ./subs-check-bin 正常退出后，才会执行到这里
           if [ -f "output/base64.txt" ]; then
-            echo "✅ 发现生成文件，开始上传..."
+            echo "✅ 节点检测完成，开始同步到 Cloudflare KV..."
+            
             curl -v -m 60 --connect-timeout 20 \
               -X PUT "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/all_nodes" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
               --data-binary @output/base64.txt
-            echo "🎉 同步完成！"
+              
+            echo -e "\n🎉 同步成功！"
           else
-            echo "❌ 错误：未在 output 目录下找到 base64.txt"
-            ls -R
+            echo "❌ 失败：未能在 output 目录下找到 base64.txt"
             exit 1
           fi
+
+      - name: Archive Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-results
+          path: output/
+          retention-days: 1
